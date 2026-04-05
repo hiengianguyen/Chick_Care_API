@@ -13,11 +13,16 @@ from module_2 import BehaviorAnalyzer
 import serial
 import json
 
+import time
+from datetime import datetime
+
 app = Flask(__name__)
 CORS(
     app,
     resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}},
 )
+
+arduino = serial.Serial("COM3",9600)
 
 # ====== Kết nối Roboflow (dùng cho /api/analyze-frame) ======
 ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "9Jn7ADj8ghfbbPwGxKS2")
@@ -167,62 +172,127 @@ def _camera_loop():
         time.sleep(0.05)  # ~20 FPS
 
 
-@app.post("/api/start-stream")
-def start_stream():
-    """
-    Bật luồng camera + phân tích trên server.
-    Gọi một lần khi UI mở.
-    """
-    global _stream_thread, _stream_running
+# @app.post("/api/start-stream")
+# def start_stream():
+#     """
+#     Bật luồng camera + phân tích trên server.
+#     Gọi một lần khi UI mở.
+#     """
+#     global _stream_thread, _stream_running
 
-    if _stream_thread is None or not _stream_thread.is_alive():
-        _stream_running = True
-        _stream_thread = threading.Thread(target=_camera_loop, daemon=True)
-        _stream_thread.start()
+#     if _stream_thread is None or not _stream_thread.is_alive():
+#         _stream_running = True
+#         _stream_thread = threading.Thread(target=_camera_loop, daemon=True)
+#         _stream_thread.start()
 
-    return jsonify({"status": "stream_started"})
-
-
-@app.get("/api/stream-frame")
-def stream_frame():
-    """
-    Trả về frame mới nhất dạng ảnh JPEG để UI hiển thị.
-    """
-    if _latest_frame_jpeg is None:
-        return jsonify({"error": "No frame available yet"}), 503
-    return Response(_latest_frame_jpeg, mimetype="image/jpeg")
+#     return jsonify({"status": "stream_started"})
 
 
-@app.get("/api/latest-data")
-def latest_data():
-    """
-    Trả về dữ liệu phân tích mới nhất (predictions, alerts, ...).
-    """
-    if _latest_data is None:
-        return jsonify({"error": "No data available yet"}), 503
-    return jsonify(_latest_data)
+# @app.get("/api/stream-frame")
+# def stream_frame():
+#     """
+#     Trả về frame mới nhất dạng ảnh JPEG để UI hiển thị.
+#     """
+#     if _latest_frame_jpeg is None:
+#         return jsonify({"error": "No frame available yet"}), 503
+#     return Response(_latest_frame_jpeg, mimetype="image/jpeg")
 
-arduino = serial.Serial("COM3",9600)
-@app.get("/api/get_data")
-def data_ardruino():
-    data = request.args.get("d")
-    arduino.write((data + "\n").encode())
-    
-    return jsonify({
-        "message": "Success" + " " +  data
-    })
 
-@app.get("/api/sensor")
+# @app.get("/api/latest-data")
+# def latest_data():
+#     """
+#     Trả về dữ liệu phân tích mới nhất (predictions, alerts, ...).
+#     """
+#     if _latest_data is None:
+#         return jsonify({"error": "No data available yet"}), 503
+#     return jsonify(_latest_data)
+
+
+last_states = {}
+def check_and_send(config):
+    global last_states
+    state = {}
+
+    device = config["device"]
+
+    if(config["active"] == False):
+        now = datetime.now()
+        current_time = now.strftime("%H:%M")
+
+        current_day = ["CN","T2","T3","T4","T5","T6","T7"][now.weekday()+1 if now.weekday()<6 else 0]
+
+        should_active = (
+            current_time in config["times"] and
+            current_day in config["selectedDays"]
+        )
+
+        state = {
+            "device": device,
+            "active": should_active,
+            "power": config.get("power")
+        }
+    else: 
+        state = {
+            "device": device,
+            "active": True,
+            "power": config.get("power")
+        }
+
+    # SO SÁNH RIÊNG TỪNG THIẾT BỊ
+    if (last_states.get(device) != state) or config.get('isEditTime'):
+
+        send_data = json.dumps(state) + "\n"
+        arduino.write(send_data.encode())
+
+        print("SEND:", send_data)
+
+        last_states[device] = state
+        return True  
+
+    return False
+
+@app.get("/api/temp-sensor")
 def get_sensor():
     try:
         data = arduino.readline().decode().strip()
         parsed = json.loads(data)
 
-        return jsonify(parsed)
+        print(parsed)
     except:
         return jsonify({
             "error": "invalid data"
         })
+    
+data = {}
+
+@app.post("/api/get_data_device")
+def light_sensor():
+    global data
+    data = request.json  # nhận object từ React
+    
+    return jsonify({
+        "data": data
+    })
+
+def read_from_arduino():
+    while True:
+        if arduino.in_waiting:
+            line = arduino.readline().decode().strip()
+            print("FROM ARDUINO:", line)
+
+def background_loop():
+    while True:
+        if data:
+            for device, config in data.items():
+
+                config["device"] = device  # gắn tên thiết bị
+                if check_and_send(config):   # 🔥 chỉ gửi 1 cái
+                    config["isEditTime"] = False
+                    break
+
+        time.sleep(1)
+
+threading.Thread(target=background_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
