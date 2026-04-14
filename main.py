@@ -7,6 +7,8 @@ import cv2
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
+import requests
+
 from module_1 import FlockMonitor
 from module_2 import BehaviorAnalyzer
 
@@ -16,13 +18,39 @@ import json
 import time
 from datetime import datetime
 
-app = Flask(__name__)
-CORS(
-    app,
-    resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}},
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+import cloudinary
+import cloudinary.uploader
+
+from flask import send_file
+from gtts import gTTS
+import io
+
+
+cloudinary.config(
+    cloud_name="dwd3gdhpf",
+    api_key="832354298759993",
+    api_secret="V1y6WSUyGdNe0H2TVQTpfJTM07A"
 )
 
-arduino = serial.Serial("COM3",9600)
+ESP32_IP = "http://192.168.1.9"  # IP ESP32
+
+app = Flask(__name__)
+
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "http://127.0.0.1:5500","http://localhost:5500"]}},
+)
+
+# arduino = serial.Serial("COM3",9600)
+
+# ====== Kết nối  FIRESTORE ======
+cred = credentials.Certificate("Database/key.json")
+firebase_admin.initialize_app(cred)
+
+db = firestore.client()
 
 # ====== Kết nối Roboflow (dùng cho /api/analyze-frame) ======
 ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "9Jn7ADj8ghfbbPwGxKS2")
@@ -38,6 +66,7 @@ _stream_thread = None
 _stream_running = False
 _latest_frame_jpeg = None  # bytes ảnh JPEG đã annotate
 _latest_data = None        # dict kết quả phân tích mới nhất
+_latest_sensor_data = {}   # dict dữ liệu sensor từ Arduino
 
 def get_inference_client():
     global _inference_client
@@ -63,12 +92,20 @@ def get_behavior_analyzer():
         _behavior_analyzer = BehaviorAnalyzer()
     return _behavior_analyzer
 
+def upload_to_cloudinary(frame):
+    _, buffer = cv2.imencode('.jpg', frame)
+
+    result = cloudinary.uploader.upload(
+        buffer.tobytes(),
+        folder="chicken_alerts"
+    )
+    
+    return result["secure_url"]
+
 
 def _camera_loop():
-    """
-    Vòng lặp nền: đọc frame từ camera, chạy Roboflow + FlockMonitor + BehaviorAnalyzer,
-    lưu kết quả vào biến global để UI chỉ cần poll.
-    """
+    # Vòng lặp nền: đọc frame từ camera, chạy Roboflow + FlockMonitor + BehaviorAnalyzer,
+    # lưu kết quả vào biến global để UI chỉ cần poll.
     global _camera, _stream_running, _latest_frame_jpeg, _latest_data
 
     if _camera is None:
@@ -147,6 +184,50 @@ def _camera_loop():
         analyzer = get_behavior_analyzer()
         alerts = analyzer.analyze(predictions)
 
+        # Nếu có alerts, upload ảnh và lưu notification
+        if alerts:
+            try:
+                image_url = upload_to_cloudinary(annotated)
+                for alert in alerts:
+                    # Tìm obj_id gần nhất với vị trí alert
+                    alert_x, alert_y = alert.get('x', 0), alert.get('y', 0)
+                    nearest_obj_id = None
+                    min_distance = float('inf')
+                    for pred in predictions:
+                        pred_x, pred_y = pred.get('x', 0), pred.get('y', 0)
+                        distance = ((pred_x - alert_x) ** 2 + (pred_y - alert_y) ** 2) ** 0.5
+                        if distance < min_distance:
+                            min_distance = distance
+                            nearest_obj_id = int(pred.get('id', 0))
+                    
+                    obj_id_str = f"#{nearest_obj_id}" if nearest_obj_id is not None else "#unknown"
+                    
+                    if alert['type'] == 'stationary':
+                        title = "PHÁT HIỆN GÀ CÓ DẤU HIỆU BẤT THƯỜNG"
+                        shortTitle = "Gà tách đàn"
+                        message = f"Hệ thống phát hiện gà {obj_id_str} di chuyển tách khỏi đàn, có thể do yếu, bệnh hoặc bị ảnh hưởng bởi môi trường. Người dùng nên kiểm tra và theo dõi các cá thể này để đảm bảo an toàn cho toàn bộ đàn."
+                    elif alert['type'] == 'separation':
+                        title = "PHÁT HIỆN GÀ CÓ DẤU HIỆU BẤT THƯỜNG"
+                        shortTitle = "Gà đứng im"
+                        message = f"Hệ thống ghi nhận con gà {obj_id_str} có dấu hiện đứng im trong một khoảng thời gian dài. Người dùng nên kiểm tra trực tiếp để xác định nguyên nhân và có biện pháp xử lý kịp thời."
+                    else:
+                        title = "PHÁT HIỆN GÀ CÓ DẤU HIỆU BẤT THƯỜNG"
+                        shortTitle = "Gà có dấu hiệu bất thường"
+                        message = "Hệ thống phát hiện có đấu hiệu bất thường vui lòng kiểm tra"
+                    
+                    notification_data = {
+                        "title": title,
+                        "shortTitle": shortTitle,
+                        "message": message,
+                        "imageUrl": image_url,
+                        "isDeleted": False,
+                        "createdAt": datetime.utcnow(),
+                        "updatedAt": datetime.utcnow(),
+                    }
+                    db.collection("notiAlerts").add(notification_data)
+            except Exception as e:
+                print(f"Error uploading to Cloudinary or saving notification: {e}")
+
         _latest_frame_jpeg = buf.tobytes()
         _latest_data = {
             "predictions": [
@@ -172,60 +253,61 @@ def _camera_loop():
         time.sleep(0.05)  # ~20 FPS
 
 
-# @app.post("/api/start-stream")
-# def start_stream():
-#     """
-#     Bật luồng camera + phân tích trên server.
-#     Gọi một lần khi UI mở.
-#     """
-#     global _stream_thread, _stream_running
+@app.post("/api/start-stream")
+def start_stream():
+    # Bật luồng camera + phân tích trên server. Gọi một lần khi UI mở.
+    global _stream_thread, _stream_running
 
-#     if _stream_thread is None or not _stream_thread.is_alive():
-#         _stream_running = True
-#         _stream_thread = threading.Thread(target=_camera_loop, daemon=True)
-#         _stream_thread.start()
+    if _stream_thread is None or not _stream_thread.is_alive():
+        _stream_running = True
+        _stream_thread = threading.Thread(target=_camera_loop, daemon=True)
+        _stream_thread.start()
 
-#     return jsonify({"status": "stream_started"})
+    return jsonify({"status": "stream_started"})
 
+@app.get("/api/stream-frame")
+def stream_frame():
+    """
+    Trả về frame mới nhất dạng ảnh JPEG để UI hiển thị.
+    """
+    if _latest_frame_jpeg is None:
+        return jsonify({"error": "No frame available yet"}), 503
+    return Response(_latest_frame_jpeg, mimetype="image/jpeg")
 
-# @app.get("/api/stream-frame")
-# def stream_frame():
-#     """
-#     Trả về frame mới nhất dạng ảnh JPEG để UI hiển thị.
-#     """
-#     if _latest_frame_jpeg is None:
-#         return jsonify({"error": "No frame available yet"}), 503
-#     return Response(_latest_frame_jpeg, mimetype="image/jpeg")
-
-
-# @app.get("/api/latest-data")
-# def latest_data():
-#     """
-#     Trả về dữ liệu phân tích mới nhất (predictions, alerts, ...).
-#     """
-#     if _latest_data is None:
-#         return jsonify({"error": "No data available yet"}), 503
-#     return jsonify(_latest_data)
-
+@app.get("/api/latest-data")
+def latest_data():
+    """
+    Trả về dữ liệu phân tích mới nhất (predictions, alerts, ...).
+    """
+    if _latest_data is None:
+        return jsonify({"error": "No data available yet"}), 503
+    return jsonify(_latest_data)
 
 last_states = {}
+feed_activation_times = {}  # Theo dõi thời gian kích hoạt feed: {"feed": timestamp}
+
 def check_and_send(config):
     global last_states
     state = {}
 
     device = config["device"]
 
+    if last_states:
+        for deviceLast, configLast in last_states.items():
+            if deviceLast == device and configLast.get('isVoiceControl') == True:
+                return False
+                
+
+    # Tính should_active dựa trên thời gian
+    now = datetime.now()
+    current_time = now.strftime("%H:%M")
+    current_day = ["CN","T2","T3","T4","T5","T6","T7"][now.weekday()+1 if now.weekday()<6 else 0]
+    should_active = (
+        current_time in config["times"] and
+        current_day in config["selectedDays"]
+    )
+
     if(config["active"] == False):
-        now = datetime.now()
-        current_time = now.strftime("%H:%M")
-
-        current_day = ["CN","T2","T3","T4","T5","T6","T7"][now.weekday()+1 if now.weekday()<6 else 0]
-
-        should_active = (
-            current_time in config["times"] and
-            current_day in config["selectedDays"]
-        )
-
         state = {
             "device": device,
             "active": should_active,
@@ -238,14 +320,68 @@ def check_and_send(config):
             "power": config.get("power")
         }
 
+    if device == "feed":
+        amount = config.get("amount", "Vừa")
+        duration_map = {"Ít": 5, "Vừa": 10, "Nhiều": 15}
+        state["duration"] = duration_map.get(amount, 10)
+        # Không gửi power, chỉ gửi duration
+        if "power" in state:
+            del state["power"]
+
+        if config.get("mode") == "Thủ công":
+            state["active"] = config["active"]
+        else: 
+            state["active"] = should_active
+
+        # Xử lý duration: nếu active=true, ghi nhận thời gian; nếu quá lâu, tự động set active=false
+        if state["active"] == True:
+            # Ghi nhận thời gian kích hoạt nếu chưa có
+            if "feed" not in feed_activation_times:
+                feed_activation_times["feed"] = datetime.now()
+        else:
+            # Xóa thời gian kích hoạt khi tắt
+            if "feed" in feed_activation_times:
+                del feed_activation_times["feed"]
+
+        # Kiểm tra nếu feed đã hoạt động quá lâu so với duration
+        if "feed" in feed_activation_times:
+            elapsed = (datetime.now() - feed_activation_times["feed"]).total_seconds()
+            if elapsed >= state["duration"]:
+                state["active"] = False
+                # Đồng bộ lại global data để lần sau không dùng active thủ công
+                if "feed" in data:
+                    data["feed"]["active"] = False
+                    # Nếu là chế độ hẹn giờ, xóa thời gian đã chạy khỏi mảng
+                    data["feed"]["times"] = [t for t in data["feed"]["times"] if t != current_time]
+                del feed_activation_times["feed"]
+
+    if device == "fan":
+        if config.get("mode") == "Thủ công":
+            state["active"] = config["active"]
+        elif config.get("mode") == "Tự động":
+            temp = _latest_sensor_data.get("temperature", 25)
+            if temp > int(config.get("thresholdTemp", 30)):
+                state["active"] = True
+            else:
+                state["active"] = should_active
+        else:  # Hẹn giờ
+            state["active"] = should_active
+
+    if device == "light":
+        if config.get("mode") == "Thủ công":
+            state["active"] = config["active"]
+        elif config.get("mode") == "Tự động":
+            temp = _latest_sensor_data.get("temperature", 25)
+            if temp < int(config.get("thresholdTemp", 25)):
+                state["active"] = True
+            else:
+                state["active"] = should_active
+        else:  # Hẹn giờ
+            state["active"] = should_active
+
     # SO SÁNH RIÊNG TỪNG THIẾT BỊ
     if (last_states.get(device) != state) or config.get('isEditTime'):
-
-        send_data = json.dumps(state) + "\n"
-        arduino.write(send_data.encode())
-
-        print("SEND:", send_data)
-
+        send_to_esp32_device(state)
         last_states[device] = state
         return True  
 
@@ -253,45 +389,244 @@ def check_and_send(config):
 
 @app.get("/api/temp-sensor")
 def get_sensor():
-    try:
-        data = arduino.readline().decode().strip()
-        parsed = json.loads(data)
-
-        print(parsed)
-    except:
-        return jsonify({
-            "error": "invalid data"
-        })
+    """Trả về dữ liệu sensor mới nhất từ Arduino."""
+    if _latest_sensor_data:
+        return jsonify(_latest_sensor_data)
+    else:
+        return jsonify({"error": "No sensor data available"}), 503
+    
+@app.post("/api/sensor")
+def sensor():
+    global _latest_sensor_data
+    data = request.json
+    _latest_sensor_data = data
+    return jsonify({"status": "ok"})
     
 data = {}
-
 @app.post("/api/get_data_device")
 def light_sensor():
     global data
     data = request.json  # nhận object từ React
     
+    # Lưu vào Firestore collection "devices" (update nếu tồn tại, tạo mới nếu không)
+    try:
+        for device_name, config in data.items():
+            doc_ref = db.collection("devices").document(device_name)
+            doc_ref.set(config, merge=True)
+    except Exception as e:
+        print(f"Error saving to Firestore: {e}")
+        return jsonify({"error": "Failed to save configuration"}), 500
+    
     return jsonify({
-        "data": data
+        "data": data,
+        "message": "Configuration saved successfully"
     })
 
-def read_from_arduino():
-    while True:
-        if arduino.in_waiting:
-            line = arduino.readline().decode().strip()
-            print("FROM ARDUINO:", line)
 
 def background_loop():
     while True:
         if data:
             for device, config in data.items():
-
                 config["device"] = device  # gắn tên thiết bị
-                if check_and_send(config):   # 🔥 chỉ gửi 1 cái
+                if last_states.get(device) and last_states.get(device, {}).get('isVoiceControl') == True: # kiểm tra xem có đang trong lệnh nói
+                    config['active'] = False
+                if check_and_send(config): 
                     config["isEditTime"] = False
                     break
 
         time.sleep(1)
 
+@app.get("/api/noti")
+def get_notifications():
+    # Lấy danh sách thông báo. Query param isDeleted=true/false để lọc.
+    is_deleted = request.args.get("isDeleted")
+    query = db.collection("notifications")
+
+    if is_deleted is not None:
+        is_deleted_lower = is_deleted.strip().lower()
+        if is_deleted_lower == "true":
+            query = query.where("isDeleted", "==", True)
+        elif is_deleted_lower == "false":
+            query = query.where("isDeleted", "==", False)
+        else:
+            return jsonify({"error": "Invalid isDeleted parameter, expected 'true' or 'false'"}), 400
+
+    docs = query.order_by("createdAt", direction=firestore.Query.DESCENDING).stream()
+    notifications = []
+    for doc in docs:
+        item = doc.to_dict() or {}
+        item["id"] = doc.id
+        notifications.append(item)
+
+    return jsonify({"notifications": notifications})
+
+@app.post("/api/add/noti")
+def add_noti():
+    data = request.json or {}
+    if not isinstance(data, dict) or not data.get("title") or not data.get("message"):
+        return jsonify({"error": "Missing required fields: title, message"}), 400
+
+    data["isDeleted"] = bool(data.get("isDeleted", False))
+    data["createdAt"] = datetime.utcnow()
+    data["updatedAt"] = datetime.utcnow()
+
+    doc_ref = db.collection("notifications").document()
+    doc_ref.set(data)
+
+    return jsonify({
+        "id": doc_ref.id,
+        "data": data,
+    }), 201
+
+@app.patch("/api/noti/<string:noti_id>/soft-delete")
+def soft_delete_noti(noti_id):
+    doc_ref = db.collection("notifications").document(noti_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return jsonify({"error": "Notification not found"}), 404
+
+    doc_ref.update({
+        "isDeleted": True,
+        "deletedAt": datetime.utcnow(),
+        "updatedAt": datetime.utcnow(),
+    })
+    return jsonify({"id": noti_id, "isDeleted": True})
+
+
+@app.delete("/api/noti/<string:noti_id>")
+def delete_noti(noti_id):
+    # Xóa vĩnh viễn thông báo khỏi Firestore.
+    doc_ref = db.collection("notifications").document(noti_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return jsonify({"error": "Notification not found"}), 404
+
+    doc_ref.delete()
+    return jsonify({"id": noti_id, "deleted": True})
+
+
+@app.get("/api/noti-alerts")
+def get_noti_alerts():
+    # Lấy danh sách thông báo từ collection notiAlerts. Query param: limit (tùy chọn).
+    limit = request.args.get("limit")
+    query = db.collection("notiAlerts").order_by("createdAt", direction=firestore.Query.DESCENDING)
+    
+    if limit:
+        try:
+            limit_int = int(limit)
+            query = query.limit(limit_int)
+        except ValueError:
+            return jsonify({"error": "Invalid limit parameter, must be an integer"}), 400
+    
+    docs = query.stream()
+    alerts = []
+    for doc in docs:
+        item = doc.to_dict() or {}
+        item["id"] = doc.id
+        alerts.append(item)
+
+    return jsonify({"alerts": alerts})
+
+
+@app.get("/api/devices")
+def get_devices():
+    """Lấy tất cả cấu hình devices từ collection 'devices'."""
+    try:
+        docs = db.collection("devices").stream()
+        devices = {}
+        for doc in docs:
+            devices[doc.id] = doc.to_dict()
+        return jsonify(devices)
+    except Exception as e:
+        print(f"Error fetching devices: {e}")
+        return jsonify({"error": "Failed to fetch devices"}), 500
+
+def send_to_esp32_device(data):
+    try:
+        res = requests.post(
+            f"{ESP32_IP}/control",
+            json=data,
+            timeout=5
+        )
+        print("ESP32:", res.text)
+    except Exception as e:
+        print("Loi gui ESP32:", e)
+
+def handle_message(msg):
+    global last_states
+    msg = msg.lower()
+
+    if "bật quạt" in msg:
+        dataConfig = {"device": "fan", "active": True, "power": 100}
+        send_to_esp32_device(dataConfig)
+        dataConfig['isVoiceControl'] = True
+        last_states['fan'] = dataConfig
+        data.get('fan',{})['active'] = True
+        return {"action": "fan_on", "reply": "Đã bật quạt"}
+    elif "tắt quạt" in msg:
+        dataConfig = {"device": "fan", "active": False, "power": 100}
+        send_to_esp32_device(dataConfig)
+        dataConfig['isVoiceControl'] = False
+        last_states['fan'] = dataConfig
+        data.get('fan',{})['active'] = False
+        return {"action": "fan_off", "reply": "Đã tắt quạt"}
+    elif "bật đèn" in msg:
+        dataConfig = {"device": "light", "active": True, "power": 100}
+        send_to_esp32_device(dataConfig)
+        dataConfig['isVoiceControl'] = True
+        last_states['light'] = dataConfig
+        data.get('light',{})['active'] = True
+        return {"action": "light", "reply": "Đã bật đèn sửi ấm"}
+    elif "tắt đèn" in msg:
+        dataConfig = {"device": "light", "active": False, "power": 100}
+        send_to_esp32_device(dataConfig)
+        dataConfig['isVoiceControl'] = False
+        last_states['light'] = dataConfig
+        data.get('light',{})['active'] = False
+        return {"action": "light", "reply": "Đã tắt đèn sửi ấm"}
+    elif "dừng cho ăn" in msg:
+        dataConfig = {"device": "feed", "active": False, "power": 100}
+        send_to_esp32_device(dataConfig)
+        dataConfig['isVoiceControl'] = False
+        last_states['feed'] = dataConfig
+        data.get('feed',{})['active'] = False
+        return {"action": "feed", "reply": "Đã tắt chế độ cho ăn"}
+    elif "cho ăn" in msg:
+        dataConfig = {"device": "feed", "active": True, "power": 100}
+        send_to_esp32_device(dataConfig)
+        dataConfig['isVoiceControl'] = True
+        last_states['feed'] = dataConfig
+        data.get('feed',{})['active'] = True
+        return {"action": "feed", "reply": "Đã bật chế độ cho ăn"}
+    elif "thông tin" in msg:
+        return {"action": "tempHum", "reply": "Hiện tại hệ thống ghi nhận, nhiệt độ là "+ str(_latest_sensor_data.get("temperature", 0))+ " độ C" +" và độ ẩm là " + str(_latest_sensor_data.get("humidity", 0)) + '%'}
+    else:
+        return {"action": "unknown", "reply": "Tôi không hiểu lệnh"}
+ 
+
+# 🌐 API chatbot
+@app.post("/api/chat")
+def chat():
+    msg = request.json["message"]
+
+    result = handle_message(msg)
+
+    return jsonify({
+        "reply": result["reply"]
+    })
+
+@app.get("/api/tts")
+def tts():
+    text = request.args.get("text")
+
+    mp3_fp = io.BytesIO()
+    tts = gTTS(text, lang='vi')
+    tts.write_to_fp(mp3_fp)
+    mp3_fp.seek(0)
+
+    return send_file(mp3_fp, mimetype="audio/mpeg")
+
+# Bắt đầu background thread cho background_loop
 threading.Thread(target=background_loop, daemon=True).start()
 
 if __name__ == "__main__":
