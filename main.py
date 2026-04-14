@@ -1,3 +1,4 @@
+from flask_socketio import SocketIO
 import os
 import random
 import threading
@@ -11,9 +12,6 @@ import requests
 
 from module_1 import FlockMonitor
 from module_2 import BehaviorAnalyzer
-
-import serial
-import json
 
 import time
 from datetime import datetime
@@ -29,19 +27,21 @@ from gtts import gTTS
 import io
 
 
+
 cloudinary.config(
     cloud_name="dwd3gdhpf",
     api_key="832354298759993",
     api_secret="V1y6WSUyGdNe0H2TVQTpfJTM07A"
 )
 
-ESP32_IP = "http://192.168.1.9"  # IP ESP32
+ESP32_IP = "http://192.168.1.17"  # IP ESP32
 
 app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*",async_mode="threading")
 
 CORS(
     app,
-    resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173", "http://127.0.0.1:5500","http://localhost:5500"]}},
+    resources={r"/api/*": {"origins": ["*"]}},
 )
 
 # arduino = serial.Serial("COM3",9600)
@@ -102,7 +102,7 @@ def upload_to_cloudinary(frame):
     
     return result["secure_url"]
 
-
+last_save_time = 0
 def _camera_loop():
     # Vòng lặp nền: đọc frame từ camera, chạy Roboflow + FlockMonitor + BehaviorAnalyzer,
     # lưu kết quả vào biến global để UI chỉ cần poll.
@@ -186,6 +186,12 @@ def _camera_loop():
 
         # Nếu có alerts, upload ảnh và lưu notification
         if alerts:
+            global last_save_time
+            now = time.time()
+            if now - last_save_time < 60:
+                continue
+            last_save_time = now
+
             try:
                 image_url = upload_to_cloudinary(annotated)
                 for alert in alerts:
@@ -202,11 +208,11 @@ def _camera_loop():
                     
                     obj_id_str = f"#{nearest_obj_id}" if nearest_obj_id is not None else "#unknown"
                     
-                    if alert['type'] == 'stationary':
+                    if alert['type'] == 'separation':
                         title = "PHÁT HIỆN GÀ CÓ DẤU HIỆU BẤT THƯỜNG"
                         shortTitle = "Gà tách đàn"
                         message = f"Hệ thống phát hiện gà {obj_id_str} di chuyển tách khỏi đàn, có thể do yếu, bệnh hoặc bị ảnh hưởng bởi môi trường. Người dùng nên kiểm tra và theo dõi các cá thể này để đảm bảo an toàn cho toàn bộ đàn."
-                    elif alert['type'] == 'separation':
+                    elif alert['type'] == 'stationary':
                         title = "PHÁT HIỆN GÀ CÓ DẤU HIỆU BẤT THƯỜNG"
                         shortTitle = "Gà đứng im"
                         message = f"Hệ thống ghi nhận con gà {obj_id_str} có dấu hiện đứng im trong một khoảng thời gian dài. Người dùng nên kiểm tra trực tiếp để xác định nguyên nhân và có biện pháp xử lý kịp thời."
@@ -221,9 +227,10 @@ def _camera_loop():
                         "message": message,
                         "imageUrl": image_url,
                         "isDeleted": False,
-                        "createdAt": datetime.utcnow(),
-                        "updatedAt": datetime.utcnow(),
+                        "createdAt": datetime.utcnow().isoformat(),
+                        "updatedAt": datetime.utcnow().isoformat(),
                     }
+                    socketio.emit("chicken_alert", notification_data)
                     db.collection("notiAlerts").add(notification_data)
             except Exception as e:
                 print(f"Error uploading to Cloudinary or saving notification: {e}")
@@ -382,6 +389,7 @@ def check_and_send(config):
     # SO SÁNH RIÊNG TỪNG THIẾT BỊ
     if (last_states.get(device) != state) or config.get('isEditTime'):
         send_to_esp32_device(state)
+        print("SEND:", state)
         last_states[device] = state
         return True  
 
@@ -477,32 +485,22 @@ def add_noti():
         "id": doc_ref.id,
         "data": data,
     }), 201
-
-@app.patch("/api/noti/<string:noti_id>/soft-delete")
-def soft_delete_noti(noti_id):
-    doc_ref = db.collection("notifications").document(noti_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        return jsonify({"error": "Notification not found"}), 404
-
-    doc_ref.update({
-        "isDeleted": True,
-        "deletedAt": datetime.utcnow(),
-        "updatedAt": datetime.utcnow(),
-    })
-    return jsonify({"id": noti_id, "isDeleted": True})
-
-
 @app.delete("/api/noti/<string:noti_id>")
 def delete_noti(noti_id):
     # Xóa vĩnh viễn thông báo khỏi Firestore.
     doc_ref = db.collection("notifications").document(noti_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        return jsonify({"error": "Notification not found"}), 404
-
     doc_ref.delete()
     return jsonify({"id": noti_id, "deleted": True})
+
+
+@app.patch("/api/noti/<string:noti_id>/soft-delete")
+def soft_delete_noti(noti_id):
+    doc_ref = db.collection("notifications").document(noti_id)
+    doc_ref.update({
+        "isDeleted": True,
+    })
+    return jsonify({"id": noti_id, "isDeleted": True})
+
 
 
 @app.get("/api/noti-alerts")
@@ -546,7 +544,7 @@ def send_to_esp32_device(data):
         res = requests.post(
             f"{ESP32_IP}/control",
             json=data,
-            timeout=5
+            timeout=2
         )
         print("ESP32:", res.text)
     except Exception as e:
@@ -630,4 +628,4 @@ def tts():
 threading.Thread(target=background_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    socketio.run(app, host="0.0.0.0", port=5000, debug=False)
