@@ -1,8 +1,9 @@
+import config
 from flask_socketio import SocketIO
 import os
 import random
-import threading
 import time
+import threading
 
 import cv2
 from flask import Flask, Response, jsonify, request
@@ -27,14 +28,13 @@ from gtts import gTTS
 import io
 
 
-
 cloudinary.config(
-    cloud_name="dwd3gdhpf",
-    api_key="832354298759993",
-    api_secret="V1y6WSUyGdNe0H2TVQTpfJTM07A"
+    cloud_name=config.CLOUD_NAME,
+    api_key=config.API_KEY_CLOUDINARY,
+    api_secret=config.API_SECRET_CLOUDINARY
 )
 
-ESP32_IP = "http://192.168.1.17"  # IP ESP32
+ESP32_IP = config.ESP32_IP  # IP ESP32
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*",async_mode="threading")
@@ -44,8 +44,6 @@ CORS(
     resources={r"/api/*": {"origins": ["*"]}},
 )
 
-# arduino = serial.Serial("COM3",9600)
-
 # ====== Kết nối  FIRESTORE ======
 cred = credentials.Certificate("Database/key.json")
 firebase_admin.initialize_app(cred)
@@ -53,8 +51,8 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 # ====== Kết nối Roboflow (dùng cho /api/analyze-frame) ======
-ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "9Jn7ADj8ghfbbPwGxKS2")
-MODEL_ID = os.environ.get("CHICK_CARE_MODEL_ID", "chicken-zqstb/2")
+ROBOFLOW_API_KEY = config.ROBOFLOW_API_KEY
+MODEL_ID = config.MODEL_ID
 
 _flock_monitor = None
 _behavior_analyzer = None
@@ -110,7 +108,7 @@ def _camera_loop():
 
     if _camera is None:
         # 0: default webcam, có thể chỉnh index / đường dẫn RTSP tuỳ nhu cầu
-        _camera = cv2.VideoCapture(0)
+        _camera = cv2.VideoCapture(1)
 
     _stream_running = True
 
@@ -183,6 +181,8 @@ def _camera_loop():
 
         analyzer = get_behavior_analyzer()
         alerts = analyzer.analyze(predictions)
+        stationaryLength = 0
+        separationLength = 0
 
         # Nếu có alerts, upload ảnh và lưu notification
         if alerts:
@@ -209,10 +209,12 @@ def _camera_loop():
                     obj_id_str = f"#{nearest_obj_id}" if nearest_obj_id is not None else "#unknown"
                     
                     if alert['type'] == 'separation':
+                        separationLength += 1
                         title = "PHÁT HIỆN GÀ CÓ DẤU HIỆU BẤT THƯỜNG"
                         shortTitle = "Gà tách đàn"
                         message = f"Hệ thống phát hiện gà {obj_id_str} di chuyển tách khỏi đàn, có thể do yếu, bệnh hoặc bị ảnh hưởng bởi môi trường. Người dùng nên kiểm tra và theo dõi các cá thể này để đảm bảo an toàn cho toàn bộ đàn."
                     elif alert['type'] == 'stationary':
+                        stationaryLength += 1
                         title = "PHÁT HIỆN GÀ CÓ DẤU HIỆU BẤT THƯỜNG"
                         shortTitle = "Gà đứng im"
                         message = f"Hệ thống ghi nhận con gà {obj_id_str} có dấu hiện đứng im trong một khoảng thời gian dài. Người dùng nên kiểm tra trực tiếp để xác định nguyên nhân và có biện pháp xử lý kịp thời."
@@ -254,6 +256,8 @@ def _camera_loop():
             "missing_alert": missing_alert,
             "crowding_alert": round(crowding_alert, 2),
             "alerts": alerts,
+            "stationaryLength": stationaryLength,
+            "separationLength": separationLength,
         }
 
         # Điều chỉnh sleep để kiểm soát FPS
@@ -597,7 +601,15 @@ def handle_message(msg):
         data.get('feed',{})['active'] = True
         return {"action": "feed", "reply": "Đã bật chế độ cho ăn"}
     elif "thông tin" in msg:
-        return {"action": "tempHum", "reply": "Hiện tại hệ thống ghi nhận, nhiệt độ là "+ str(_latest_sensor_data.get("temperature", 0))+ " độ C" +" và độ ẩm là " + str(_latest_sensor_data.get("humidity", 0)) + '%'}
+        return {"action": "tempHum", "reply": "Hiện tại hệ thống ghi nhận, số gà được phát hiện trong môi trường là "
+                + ((str(_latest_data.get("predictions_count", "0")) + ' con') if _latest_data else '0 con') 
+                + ", mật độ cao nhất là " 
+                + ((str(_latest_data.get("crowding_alert", "0")) + '%') if _latest_data else '0%') 
+                + ", số gà đứng yên là "
+                + ((str(_latest_data.get("stationaryLength", "0")) + ' con') if _latest_data else '0 con')
+                + ", số gà tách đàn là "
+                + ((str(_latest_data.get("separationLength", "0")) + ' con') if _latest_data else '0 con') 
+                +", nhiệt độ là "+ str(_latest_sensor_data.get("temperature", 0))+ " độ C" +" và độ ẩm là " + str(_latest_sensor_data.get("humidity", 0)) + '%'}
     else:
         return {"action": "unknown", "reply": "Tôi không hiểu lệnh"}
  
