@@ -229,11 +229,13 @@ def _camera_loop():
                         "message": message,
                         "imageUrl": image_url,
                         "isDeleted": False,
-                        "createdAt": datetime.utcnow().isoformat(),
-                        "updatedAt": datetime.utcnow().isoformat(),
+                        "isRead": False,
+                        "createdAt": datetime.utcnow().isoformat() + 'Z',
+                        "updatedAt": datetime.utcnow().isoformat() + 'Z',
                     }
+                    write_time, doc_ref= db.collection("notiAlerts").add(notification_data)
+                    notification_data["id"] = doc_ref.id
                     socketio.emit("chicken_alert", notification_data)
-                    db.collection("notiAlerts").add(notification_data)
             except Exception as e:
                 print(f"Error uploading to Cloudinary or saving notification: {e}")
 
@@ -448,62 +450,19 @@ def background_loop():
 
         time.sleep(1)
 
-@app.get("/api/noti")
-def get_notifications():
-    # Lấy danh sách thông báo. Query param isDeleted=true/false để lọc.
-    is_deleted = request.args.get("isDeleted")
-    query = db.collection("notifications")
-
-    if is_deleted is not None:
-        is_deleted_lower = is_deleted.strip().lower()
-        if is_deleted_lower == "true":
-            query = query.where("isDeleted", "==", True)
-        elif is_deleted_lower == "false":
-            query = query.where("isDeleted", "==", False)
-        else:
-            return jsonify({"error": "Invalid isDeleted parameter, expected 'true' or 'false'"}), 400
-
-    docs = query.order_by("createdAt", direction=firestore.Query.DESCENDING).stream()
-    notifications = []
-    for doc in docs:
-        item = doc.to_dict() or {}
-        item["id"] = doc.id
-        notifications.append(item)
-
-    return jsonify({"notifications": notifications})
-
-@app.post("/api/add/noti")
-def add_noti():
-    data = request.json or {}
-    if not isinstance(data, dict) or not data.get("title") or not data.get("message"):
-        return jsonify({"error": "Missing required fields: title, message"}), 400
-
-    data["isDeleted"] = bool(data.get("isDeleted", False))
-    data["createdAt"] = datetime.utcnow()
-    data["updatedAt"] = datetime.utcnow()
-
-    doc_ref = db.collection("notifications").document()
-    doc_ref.set(data)
-
-    return jsonify({
-        "id": doc_ref.id,
-        "data": data,
-    }), 201
 @app.delete("/api/noti/<string:noti_id>")
 def delete_noti(noti_id):
     # Xóa vĩnh viễn thông báo khỏi Firestore.
-    doc_ref = db.collection("notifications").document(noti_id)
-    doc_ref.delete()
+    db.collection("notiAlerts").document(noti_id).delete()
     return jsonify({"id": noti_id, "deleted": True})
 
-
-@app.patch("/api/noti/<string:noti_id>/soft-delete")
-def soft_delete_noti(noti_id):
-    doc_ref = db.collection("notifications").document(noti_id)
+@app.post("/api/noti/read/<string:noti_id>")
+def noti_readed_noti(noti_id):
+    doc_ref = db.collection("notiAlerts").document(noti_id)
     doc_ref.update({
-        "isDeleted": True,
+        "isRead": True,
     })
-    return jsonify({"id": noti_id, "isDeleted": True})
+    return jsonify({"id": noti_id, "isRead": True})
 
 
 
@@ -522,13 +481,15 @@ def get_noti_alerts():
     
     docs = query.stream()
     alerts = []
+    isRead = 0
     for doc in docs:
         item = doc.to_dict() or {}
         item["id"] = doc.id
+        if item.get("isRead", True) == False:
+            isRead += 1
         alerts.append(item)
 
-    return jsonify({"alerts": alerts})
-
+    return jsonify({"isReadCount": isRead,"alerts": alerts})
 
 @app.get("/api/devices")
 def get_devices():
