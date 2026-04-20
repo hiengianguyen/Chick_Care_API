@@ -310,15 +310,16 @@ def check_and_send(config):
             if deviceLast == device and configLast.get('isVoiceControl') == True:
                 return False
                 
-
-    # Tính should_active dựa trên thời gian
-    now = datetime.now()
-    current_time = now.strftime("%H:%M")
-    current_day = ["CN","T2","T3","T4","T5","T6","T7"][now.weekday()+1 if now.weekday()<6 else 0]
-    should_active = (
-        current_time in config["times"] and
-        current_day in config["selectedDays"]
-    )
+    should_active = False     
+    if config.get('times'):
+        # Tính should_active dựa trên thời gian
+        now = datetime.now()
+        current_time = now.strftime("%H:%M")
+        current_day = ["CN","T2","T3","T4","T5","T6","T7"][now.weekday()+1 if now.weekday()<6 else 0]
+        should_active = (
+            current_time in config["times"] and
+            current_day in config["selectedDays"]
+        )
 
     if(config["active"] == False):
         state = {
